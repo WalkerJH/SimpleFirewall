@@ -96,7 +96,7 @@ int mkfdset(fd_set* set, ...);
 /* Bridge 
  * tap     The local tap device
  * in      The network socket that receives broadcast packets.
- * out     The network socket on with to send broadcast packets.
+ * out     The network socket on which to send broadcast packets.
  * bcaddr  The broadcast address for the virtual ethernet link.
  *
  * This is the main loop for wfw.  Data from the tap is broadcast on the
@@ -104,6 +104,13 @@ int mkfdset(fd_set* set, ...);
  */
 static
 void bridge(int tap, int in, int out, struct sockaddr_in bcaddr);
+
+/* addresscmp
+ *
+ * Comparison function for two MAC addresses
+ */
+static
+int addresscmp (void* addr1, void* addr2);
 
 /* Main
  * 
@@ -282,40 +289,91 @@ int mkfdset(fd_set* set, ...) {
 static
 void bridge(int tap, int in, int out, struct sockaddr_in bcaddr) {
 #define BUFSZ 1526
+#define MAX_CONNECTED_DEVICES 64
 
-  fd_set rdset;
+	fd_set rdset;
 
-  int maxfd = mkfdset(&rdset, tap, in, 0);
+	int maxfd = mkfdset(&rdset, tap, in, out, 0);
 
-  char buffer[BUFSZ];
+	// Structure type to hold the incoming ethernet frame
+	struct frame_t {
+		char dst[6];
+		char src[6];
+		short type;
+		char payload[1500];
+	};
 
-  while(0 <= select(1+maxfd, &rdset, NULL, NULL, NULL)) {
+	// Hash map to match MAC addresses with sources of network traffic
+	hashtable
+	address_hash = htnew( MAX_CONNECTED_DEVICES, addresscmp, 0);
 
-    if(FD_ISSET(tap, &rdset)) {
-      ssize_t rdct = read(tap, buffer, BUFSZ);
-      if(rdct < 0) {
-        perror("read");
-      }
-      else if (-1 == sendto(out, buffer, rdct, 0,
-                            (struct sockaddr*)&bcaddr,
-                            sizeof(bcaddr))){
-        perror("sendto");
-      }
-    }
-    else if(FD_ISSET(in, &rdset)) {
-      struct sockaddr_in from;
-      socklen_t          flen = sizeof(from);
-      ssize_t rdct = recvfrom(in, buffer, BUFSZ, 0, 
-                              (struct sockaddr*)&from, &flen);
-      if(rdct < 0) {
-        perror("recvfrom");
-      }
-      else if(-1 == write(tap, buffer, rdct)) {
-        perror("write");
-      }
-    }
-    
-    maxfd = mkfdset(&rdset, tap, in, 0);
-  }
-  
+	// Loop to receive incoming frames and decide what to do with them
+	while (0 <= select(1 + maxfd, &rdset, NULL, NULL, NULL)) {
+
+		// Tap
+		if (FD_ISSET(tap, &rdset)) {
+			struct frame_t current_frame;
+			ssize_t rdct = read(tap, (void*) &current_frame, BUFSZ);
+			if (rdct < 0) {
+				perror("read");
+			} else {
+				// Look for the MAC address in the hash table
+				void* socket;
+				if (hthaskey(address_hash, (&current_frame)->dst, 6)) {
+					socket = htfind(address_hash, (&current_frame)->dst, 6);
+				} else {
+					socket = (void*) &bcaddr;
+				}
+					if (-1 == sendto(out, (void *) &current_frame, rdct, 0, (struct sockaddr *) &socket, sizeof(socket))) {
+						perror("sendto");
+					}
+
+			}
+		}
+
+		// In
+		else if (FD_ISSET(in, &rdset)) {
+			struct sockaddr_in from;
+			struct frame_t current_frame;
+			socklen_t flen = sizeof(from);
+			ssize_t rdct = recvfrom(in, (void*) &current_frame, BUFSZ, 0, (struct sockaddr *) &from, &flen);
+			if (rdct < 0) {
+				perror("recvfrom");
+			} else if (-1 == write(tap, (void*) &current_frame, rdct)) {
+				perror("write");
+			}
+			// Insert a hash table entry storing MAC+IPV4
+			if (false == htinsert(address_hash, (&current_frame)->src, 6, (void*) &from)) {
+				perror("htinsert");
+			}
+		}
+
+		// Out
+		else if (FD_ISSET(out, &rdset)) {
+			struct sockaddr_in from;
+			struct frame_t current_frame;
+			socklen_t flen = sizeof(from);
+			ssize_t rdct = recvfrom(out, (void*) &current_frame, BUFSZ, 0, (struct sockaddr *) &from, &flen);
+			if (rdct < 0) {
+				perror("recvfrom");
+			} else if (-1 == write(out, (void*) &current_frame, rdct)) {
+				perror("write");
+			}
+			// Insert a hash table entry storing MAC+IPV4
+			if (false == htinsert(address_hash, (&current_frame)->src, 6, (void*) &from)) {
+				perror("htinsert");
+			}
+		}
+
+		maxfd = mkfdset(&rdset, tap, in, out, 0);
+	}
+}
+
+/* addresscmp
+ *
+ * Comparison function for two MAC addresses
+ */
+static
+int addresscmp (void* addr1, void* addr2) {
+	return memcmp (addr1, addr2, 6);
 }

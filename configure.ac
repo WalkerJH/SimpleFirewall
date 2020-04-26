@@ -1,6 +1,6 @@
 AC_PREREQ([2.64])
 
-AC_INIT([wfw], [1.0], [youruid@wwu.edu])
+AC_INIT([wfw], [1.0], [herrinw@wwu.edu])
 AM_INIT_AUTOMAKE([silent-rules subdir-objects foreign])
 AM_SILENT_RULES
 
