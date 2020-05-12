@@ -24,6 +24,7 @@
 #define BROADCAST "broadcast"
 #define ANYIF     "0.0.0.0"
 #define ANYPORT   "0"
+#define PID       "pidfile"
 
 
 /* Globals  */
@@ -112,6 +113,20 @@ void bridge(int tap, int in, int out, struct sockaddr_in bcaddr);
 static
 int addresscmp (void* addr1, void* addr2);
 
+/* tcpcmp
+ *
+ * Comparison function for two tcp server info structs
+ */
+static
+int tcpcmp (void* tcp1, void* tcp2);
+
+/* freepair
+ *
+ * Free a key value pair in the hash table
+ */
+static
+void freepair (void* key, void* val);
+
 /* Main
  * 
  * Mostly, main parses the command line, the conf file, creates the necessary
@@ -136,7 +151,16 @@ int main(int argc, char* argv[]) {
     struct sockaddr_in
       bcaddr       = makesockaddr (htstrfind (conf,BROADCAST),
                                    htstrfind (conf, PORT));
-    
+
+    daemon(0,0);
+    if (hthasstrkey(conf, PID)) {
+	    FILE *pidfile = fopen(htstrfind(conf, PID), "w");
+	    if (pidfile != NULL) {
+		    fprintf(pidfile, "%d\n", getpid());
+		    fclose(pidfile);
+	    }
+    }
+
     bridge(tap, in, out, bcaddr);
     
     close(in);
@@ -288,62 +312,109 @@ int mkfdset(fd_set* set, ...) {
  */
 static
 void bridge(int tap, int in, int out, struct sockaddr_in bcaddr) {
-#define BUFSZ 1526
+#define BUFSZ 1514
 #define MAX_CONNECTED_DEVICES 64
 
 	fd_set rdset;
 
 	int maxfd = mkfdset(&rdset, tap, in, out, 0);
 
-	// Structure type to hold the incoming ethernet frame
-	struct frame_t {
+	struct ethernet_frame_t {
 		char dst[6];
 		char src[6];
-		short type;
+		uint16_t type;
 		char payload[1500];
 	};
 
-	// Hash map to match MAC addresses with sources of network traffic
-	hashtable
-	address_hash = htnew( MAX_CONNECTED_DEVICES, addresscmp, 0);
+	struct ipv6_packet_t {
+		int version: 4,
+				traffic_class: 8,
+				flow_label: 20;
+		uint16_t payload_length;
+		char next_header;
+		char hop_limit;
+		char source_address[16];
+		char destination_address[16];
+		char headers[];
+	};
+	enum header_signifiers {
+		NEXT_TCP = 0x6,
+		NEXT_UDP = 0x11,
+	};
+
+	struct tcp_segment_t {
+		uint16_t source_port;
+		uint16_t destination_port;
+		uint32_t sequence_number;
+		uint32_t ack_number;
+		int padding0: 4,
+				header_size: 4,
+				FIN: 1,
+				SYN: 1,
+				RST: 1,
+				PSH: 1,
+				ACK: 1,
+				URG: 1,
+				padding1: 2;
+		uint16_t receive_window;
+		uint16_t checksum;
+		char options[];
+	};
+
+	struct saved_tcp {
+		uint16_t local_port;
+		uint16_t remote_port;
+		char remote_address[16];
+	};
+
+	hashtable known_addresses = htnew( MAX_CONNECTED_DEVICES, addresscmp, freepair);
+	hashtable known_tcp_servers = htnew( MAX_CONNECTED_DEVICES, addresscmp, freepair);
 
 	// Loop to receive incoming frames and decide what to do with them
 	while (0 <= select(1 + maxfd, &rdset, NULL, NULL, NULL)) {
 
 		// Tap
 		if (FD_ISSET(tap, &rdset)) {
-			struct frame_t current_frame;
-			ssize_t rdct = read(tap, (void*) &current_frame, BUFSZ);
+			struct ethernet_frame_t *current_frame  = malloc(sizeof(struct ethernet_frame_t));
+			ssize_t rdct = read(tap, (void*) current_frame, BUFSZ);
 			if (rdct < 0) {
 				perror("read");
 			} else {
-				// Look for the MAC address in the hash table
-				void* socket;
-				if (hthaskey(address_hash, (&current_frame)->dst, 6)) {
-					socket = htfind(address_hash, (&current_frame)->dst, 6);
-				} else {
-					socket = (void*) &bcaddr;
-				}
-					if (-1 == sendto(out, (void *) &current_frame, rdct, 0, (struct sockaddr *) &socket, sizeof(socket))) {
-						perror("sendto");
+				struct ipv6_packet_t *current_packet = (ipv6_packet_t *)current_frame->payload;
+				if (current_packet->next_header == NEXT_TCP) {
+					struct tcp_segment_t *current_segment = (tcp_segment_t *)current_packet->headers;
+					if (current_segment->SYN == 1) {
+						struct saved_tcp *new_tcp = malloc(sizeof(struct saved_tcp));
+						saved_tcp->local_port = current_segment->source_port;
+						saved_tcp->remote_port = current_segment->destination_port;
+						saved_tcp->remote_address = current_packet->destination_address;
 					}
+				}
 
+				struct sockaddr_in* socket;
+				socket = &bcaddr;
+				if (hthaskey(known_addresses, current_frame->dst, 6)) {
+					socket = (struct sockaddr_in *)htfind(known_addresses, current_frame->dst, 6);
+				}
+				if (-1 == sendto(out, (void *) current_frame, rdct, 0, (struct sockaddr *)socket, sizeof(*socket))) {
+					perror("sendto");
+				}
 			}
 		}
 
 		// In
 		else if (FD_ISSET(in, &rdset)) {
 			struct sockaddr_in from;
-			struct frame_t current_frame;
+			struct ethernet_frame_t *current_frame = malloc(sizeof(struct ethernet_frame_t));
 			socklen_t flen = sizeof(from);
-			ssize_t rdct = recvfrom(in, (void*) &current_frame, BUFSZ, 0, (struct sockaddr *) &from, &flen);
+			ssize_t rdct = recvfrom(in, (void*) current_frame, BUFSZ, 0, (struct sockaddr *) &from, &flen);
 			if (rdct < 0) {
 				perror("recvfrom");
-			} else if (-1 == write(tap, (void*) &current_frame, rdct)) {
+			} else if (-1 == write(tap, (void*) current_frame, rdct)) {
 				perror("write");
 			}
-			// Insert a hash table entry storing MAC+IPV4
-			if (false == htinsert(address_hash, (&current_frame)->src, 6, (void*) &from)) {
+
+			if (false == htinsert(known_addresses, current_frame->src, 6, (void *) &from)) {
 				perror("htinsert");
 			}
 		}
@@ -351,22 +422,24 @@ void bridge(int tap, int in, int out, struct sockaddr_in bcaddr) {
 		// Out
 		else if (FD_ISSET(out, &rdset)) {
 			struct sockaddr_in from;
-			struct frame_t current_frame;
+			struct ethernet_frame_t *current_frame = malloc(sizeof(struct ethernet_frame_t));
 			socklen_t flen = sizeof(from);
-			ssize_t rdct = recvfrom(out, (void*) &current_frame, BUFSZ, 0, (struct sockaddr *) &from, &flen);
+			ssize_t rdct = recvfrom(out, (void*) current_frame, BUFSZ, 0, (struct sockaddr *) &from, &flen);
 			if (rdct < 0) {
 				perror("recvfrom");
-			} else if (-1 == write(out, (void*) &current_frame, rdct)) {
+			} else if (-1 == write(out, (void*) current_frame, rdct)) {
 				perror("write");
 			}
-			// Insert a hash table entry storing MAC+IPV4
-			if (false == htinsert(address_hash, (&current_frame)->src, 6, (void*) &from)) {
+
+			if (false == htinsert(known_addresses, current_frame->src, 6, (void *) &from)) {
 				perror("htinsert");
 			}
 		}
 
 		maxfd = mkfdset(&rdset, tap, in, out, 0);
 	}
+
+	htfree(known_addresses);
 }
 
 /* addresscmp
@@ -376,4 +449,23 @@ void bridge(int tap, int in, int out, struct sockaddr_in bcaddr) {
 static
 int addresscmp (void* addr1, void* addr2) {
 	return memcmp (addr1, addr2, 6);
+}
+
+/* tcpcmp
+ *
+ * Comparison function for two tcp server info structs
+ */
+static
+int addresscmp (void* tcp1, void* tcp2) {
+	return memcmp (tcp1, tcp2, sizeof(saved_tcp));
+}
+
+/* freepair
+ *
+ * Free a key value pair in the hash table
+ */
+static
+void freepair (void* key, void* val) {
+	free(key);
+	free(val);
 }
