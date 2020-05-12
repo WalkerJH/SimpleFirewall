@@ -368,7 +368,7 @@ void bridge(int tap, int in, int out, struct sockaddr_in bcaddr) {
 	};
 
 	hashtable known_addresses = htnew( MAX_CONNECTED_DEVICES, addresscmp, freepair);
-	hashtable known_tcp_servers = htnew( MAX_CONNECTED_DEVICES, addresscmp, freepair);
+	hashtable known_tcp_servers = htnew( MAX_CONNECTED_DEVICES, tcpcmp, freepair);
 
 	// Loop to receive incoming frames and decide what to do with them
 	while (0 <= select(1 + maxfd, &rdset, NULL, NULL, NULL)) {
@@ -385,9 +385,13 @@ void bridge(int tap, int in, int out, struct sockaddr_in bcaddr) {
 					struct tcp_segment_t *current_segment = (tcp_segment_t *)current_packet->headers;
 					if (current_segment->SYN == 1) {
 						struct saved_tcp *new_tcp = malloc(sizeof(struct saved_tcp));
-						saved_tcp->local_port = current_segment->source_port;
-						saved_tcp->remote_port = current_segment->destination_port;
-						saved_tcp->remote_address = current_packet->destination_address;
+						new_tcp->local_port = current_segment->source_port;
+						new_tcp->remote_port = current_segment->destination_port;
+						new_tcp->remote_address = current_packet->destination_address;
+
+						if (false == htinsert(known_addresses, new_tcp, sizeof(saved_tcp),null)) {
+							perror("htinsert");
+						}
 					}
 				}
 
@@ -456,7 +460,7 @@ int addresscmp (void* addr1, void* addr2) {
  * Comparison function for two tcp server info structs
  */
 static
-int addresscmp (void* tcp1, void* tcp2) {
+int tcpcmp (void* tcp1, void* tcp2) {
 	return memcmp (tcp1, tcp2, sizeof(saved_tcp));
 }
 
