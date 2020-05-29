@@ -31,50 +31,53 @@
 static char* conffile   = STR(SYSCONFDIR) "/wfw.cfg";
 static bool  printusage = false;
 
-typedef struct ethernet_frame {
+/* Types */
+typedef struct frame {
 	uint8_t dst[6];
 	uint8_t src[6];
 	uint16_t type;
 	uint8_t payload[1500];
-} ethernet_frame_t;
-enum type_signifiers {
+} frame_t;
+
+enum frametypes {
 	TYPE_IPV6 = 0xdd86,
 };
 
-typedef struct ipv6_packet {
-	unsigned int  version: 4,
-		traffic_class: 8,
-		flow_label: 20;
+typedef struct packet {
+	uint32_t version: 4;
+	uint32_t traffic_class: 8;
+	uint32_t flow_label: 20;
 	uint16_t payload_length;
 	uint8_t next_header;
 	uint8_t hop_limit;
 	uint8_t source_address[16];
 	uint8_t destination_address[16];
 	uint8_t headers[];
-} ipv6_packet_t;
-enum header_signifiers {
+} packet_t;
+
+enum headers {
 	NEXT_TCP = 0x6,
 	NEXT_UDP = 0x11,
 };
 
-typedef struct tcp_segment {
+typedef struct tcpsegment {
 	uint16_t source_port;
 	uint16_t destination_port;
 	uint32_t sequence_number;
 	uint32_t ack_number;
-	unsigned int  padding0: 4,
-		header_size: 4,
-		FIN: 1,
-		SYN: 1,
-		RST: 1,
-		PSH: 1,
-		ACK: 1,
-		URG: 1,
-		padding1: 2;
+	uint16_t empty0: 4;
+	uint16_t header_size: 4;
+	uint16_t FIN: 1;
+	uint16_t SYN: 1;
+	uint16_t RST: 1;
+	uint16_t PSH: 1;
+	uint16_t ACK: 1;
+	uint16_t URG: 1;
+	uint16_t empty1: 2;
 	uint16_t receive_window;
 	uint16_t checksum;
 	uint8_t options[];
-} tcp_segment_t;
+} tcpsegment_t;
 
 typedef struct saved_tcp {
 	uint16_t local_port;
@@ -156,12 +159,21 @@ int mkfdset(fd_set* set, ...);
 static
 void bridge(int tap, int in, int out, struct sockaddr_in bcaddr);
 
-/* managetraffic
+/* sendtraffic
  *
- * Helper function to manage traffic on in and out connections
+ * Send traffic out
  */
 static
-void managetraffic(int device_in, int device_out, hashtable* known_addresses, hashtable* known_tcp_connections);
+void sendtraffic(int tap, int out, struct sockaddr_in bcaddr,
+                 hashtable* known_addrs, hashtable* known_tcp, hashtable* blacklist);
+
+/* gettraffic
+ *
+ * Recieve traffic on given device
+ */
+static
+void gettraffic(int tap, int socket, hashtable* known_addrs,
+											hashtable* known_tcp, hashtable* blacklist);
 
 /* addresscmp
  *
@@ -177,6 +189,13 @@ int addresscmp(void* addr1, void* addr2);
 static
 int tcpcmp(void* tcp1, void* tcp2);
 
+/* ipaddrcmp
+ *
+ * Comparison function for two ipv6 addresses
+ */
+static
+int ipaddrcmp(void* ipaddr1, void* ipaddr2);
+
 /* freepair
  *
  * Free a key value pair in the hash table
@@ -184,12 +203,48 @@ int tcpcmp(void* tcp1, void* tcp2);
 static
 void freepair(void* key, void* val);
 
+/* memdup
+ *
+ * Malloc and copy memory
+ */
+static
+void* memdup(void* addr, size_t size);
+
+/* isbcaddr
+ *
+ * Check for broadcast MAC address
+ */
+static
+int isbcaddr(uint8_t addr[6]);
+
+/* blklist_init
+ *
+ * Initialize TCP blacklist server
+ */
+static
+void blklist_init();
+
+/* blklist_push
+ *
+ * Push a blacklisted IP address to the server
+ */
+static
+void blklist_push(void* addr);
+
+/* blklist_pull
+ *
+ * Pull the blacklisted ip addresses and add them to hashtable
+ */
+static
+void blklist_pull(hashtable ht);
+
 /* Main
  * 
  * Mostly, main parses the command line, the conf file, creates the necessary
  * structures and then calls bridge.  Bridge is where the real work is done. 
  */
 int main(int argc, char* argv[]) {
+	puts("WFW Initialized\n");
   int result = EXIT_SUCCESS;
 
   if(!parseoptions(argc, argv)) {
@@ -283,7 +338,7 @@ void usage(char* cmd, FILE* file) {
 static
 int ensuretap(char* path) {
   int fd = open(path, O_RDWR | O_NOSIGPIPE);
-  if(-1 == fd) {
+  if(fd == -1) {
     perror("open");
     fprintf(stderr, "Failed to open device %s\n", path);
     exit(EXIT_FAILURE);
@@ -298,14 +353,14 @@ int ensuretap(char* path) {
 static
 int ensuresocket(char* localaddr, char* port) {
   int sock = socket(PF_INET, SOCK_DGRAM, 0);
-  if(-1 == sock) {
+  if(sock == -1) {
     perror("socket");
     exit (EXIT_FAILURE);
   }
 
   int bcast = 1;
-  if (-1 == setsockopt(sock, SOL_SOCKET, SO_BROADCAST,
-                       &bcast, sizeof(bcast))) {
+  if (setsockopt(sock, SOL_SOCKET, SO_BROADCAST,
+                       &bcast, sizeof(bcast)) == -1) {
     perror("setsockopt(broadcast)");
     exit(EXIT_FAILURE);
   }
@@ -370,114 +425,140 @@ int mkfdset(fd_set* set, ...) {
 static
 void bridge(int tap, int in, int out, struct sockaddr_in bcaddr) {
 #define BUFSZ 1514
-#define MAX_CONNECTED_DEVICES 64
 
 	fd_set rdset;
 
 	int maxfd = mkfdset(&rdset, tap, in, out, 0);
 
-	hashtable known_addresses = htnew( MAX_CONNECTED_DEVICES, addresscmp, freepair);
-	hashtable known_tcp_connections = htnew( MAX_CONNECTED_DEVICES, tcpcmp, freepair);
+	hashtable known_addrs = htnew(16, addresscmp, freepair);
+	hashtable known_tcp   = htnew(sizeof(saved_tcp_t), tcpcmp, freepair);
+	hashtable blacklist   = htnew(16, ipaddrcmp, freepair);
+	blklist_init();
 
-	// Loop to receive incoming frames and decide what to do with them
 	while (0 <= select(1 + maxfd, &rdset, NULL, NULL, NULL)) {
 
-		// Tap
 		if (FD_ISSET(tap, &rdset)) {
-			ethernet_frame_t *current_frame  = malloc(sizeof(ethernet_frame_t));
-			ssize_t rdct = read(tap, (void*) current_frame, BUFSZ);
-			if (rdct < 0) {
-				perror("read");
-			} else {
-
-				struct sockaddr_in* socket;
-				socket = &bcaddr;
-				if (hthaskey(known_addresses, current_frame->dst, 6)) {
-					socket = (struct sockaddr_in *)htfind(known_addresses, current_frame->dst, 6);
-				}
-				if (-1 == sendto(out, (void *) current_frame, rdct, 0, (struct sockaddr *)socket, sizeof(*socket))) {
-					perror("sendto");
-				}
-
-				if (current_frame->type == TYPE_IPV6) {
-					ipv6_packet_t *current_packet = (ipv6_packet_t *) current_frame->payload;
-					if (current_packet->next_header == NEXT_TCP) {
-						tcp_segment_t *current_segment = (tcp_segment_t *) current_packet->headers;
-						if (current_segment->SYN == 1) {
-
-							saved_tcp_t *new_tcp = malloc(sizeof(saved_tcp_t));
-							new_tcp->local_port = current_segment->source_port;
-							new_tcp->remote_port = current_segment->destination_port;
-							memcpy(&(new_tcp->remote_address), &(current_packet->destination_address), 128);
-
-							if (false == htinsert(known_tcp_connections, new_tcp, 40, 0)) {
-								perror("htinsert");
-							}
-						}
-					}
-				}
-
-			}
+			sendtraffic(tap, out, bcaddr, &known_addrs, &known_tcp, &blacklist);
 		}
 
-		// In
 		else if (FD_ISSET(in, &rdset)) {
-			managetraffic(in, tap, &known_addresses, &known_tcp_connections);
+			gettraffic(tap, in, &known_addrs, &known_tcp, &blacklist);
 		}
 
-		// Out
 		else if (FD_ISSET(out, &rdset)) {
-			managetraffic(out, out, &known_addresses, &known_tcp_connections);
+			gettraffic(tap, out, &known_addrs, &known_tcp, &blacklist);
 		}
 
 		maxfd = mkfdset(&rdset, tap, in, out, 0);
 	}
 
-	htfree(known_addresses);
-	htfree(known_tcp_connections);
+	htfree(known_addrs);
+	htfree(known_tcp);
+	htfree(blacklist);
 }
 
-/* managetraffic
+/* sendtraffic
  *
- * Helper function to manage traffic on in and out connections
+ * Send traffic out
  */
 static
-void managetraffic (int device_in, int device_out, hashtable* known_addresses, hashtable* known_tcp_connections) {
-	int sending_traffic = 1;
-	struct sockaddr_in from;
-	ethernet_frame_t *current_frame = malloc(sizeof(ethernet_frame_t));
-	socklen_t flen = sizeof(from);
-	ssize_t rdct = recvfrom(device_in, (void*) current_frame, BUFSZ, 0, (struct sockaddr *) &from, &flen);
+void sendtraffic(int tap, int out, struct sockaddr_in bcaddr,
+									hashtable* known_addrs, hashtable* known_tcp, hashtable* blacklist) {
+	frame_t *frame  = malloc(sizeof(frame_t));
+	ssize_t rdct = read(tap, (void*)frame, BUFSZ);
 	if (rdct < 0) {
-		perror("recvfrom");
+		perror("read");
 	} else {
-		if (current_frame->type == TYPE_IPV6) {
-			ipv6_packet_t *current_packet = (ipv6_packet_t *) current_frame->payload;
-			if (current_packet->next_header == NEXT_TCP) {
-				tcp_segment_t *current_segment = (tcp_segment_t *) current_packet->headers;
-				if (current_segment->SYN == 1) {
+		struct sockaddr_in* socket;
+		socket = &bcaddr;
 
+		if (isbcaddr(frame->dst) == 0 && hthaskey(*known_addrs, frame->dst, 6)) {
+			socket = (struct sockaddr_in *)htfind(*known_addrs, frame->dst, 6);
+		}
+		if (sendto(out, (void *)frame, rdct, 0,
+		           (struct sockaddr *)socket, sizeof(struct sockaddr_in)) == -1) {
+			perror("sendto");
+		}
+
+		if (frame->type == TYPE_IPV6) {
+			packet_t *packet = (packet_t *)frame->payload;
+			if (packet->next_header == NEXT_TCP) {
+				tcpsegment_t *segment = (tcpsegment_t *)packet->headers;
+				if (segment->SYN == 1) {
 					saved_tcp_t *new_tcp = malloc(sizeof(saved_tcp_t));
-					new_tcp->local_port = current_segment->destination_port;
-					new_tcp->remote_port = current_segment->source_port;
-					memcpy(&(new_tcp->remote_address), &(current_packet->source_address), 128);
+					memcpy(&new_tcp->local_port, &segment->source_port, 2);
+					memcpy(&new_tcp->remote_port, &segment->destination_port, 2);
+					memcpy(&new_tcp->remote_address, &packet->destination_address, 16);
 
-					if (NULL == htfind(*known_tcp_connections, new_tcp, 40)) {
-						sending_traffic = 0;
+					if (!hthaskey(*known_tcp, new_tcp, sizeof(saved_tcp_t))) {
+						htinsert(*known_tcp, new_tcp, sizeof(saved_tcp_t), 0);
 					}
 				}
 			}
 		}
-		if (sending_traffic == 1) {
-			if (-1 == write(device_out, (void *) current_frame, rdct)) {
+	}
+	free(frame);
+}
+
+/* gettraffic
+ *
+ * Recieve traffic on given device
+ */
+static
+void gettraffic (int tap, int socket,
+									hashtable* known_addrs, hashtable* known_tcp, hashtable* blacklist) {
+	int valid = 1;
+	struct sockaddr_in from;
+	frame_t *frame = malloc(sizeof(frame_t));
+	socklen_t flen = sizeof(from);
+	ssize_t rdct = recvfrom(socket, (void*)frame, BUFSZ, 0,
+		(struct sockaddr *) &from, &flen);
+	if (rdct < 0) {
+		perror("recvfrom");
+	} else {
+
+		if (frame->type == TYPE_IPV6) {
+			packet_t *packet = (packet_t *) frame->payload;
+			if (hthaskey(*blacklist, packet->source_address, 16)) {
+			//	valid = 0;
+			}
+			if (packet->next_header == NEXT_TCP) {
+				tcpsegment_t *segment = (tcpsegment_t *) packet->headers;
+				if (segment->SYN == 1) {
+					saved_tcp_t *new_tcp = malloc(sizeof(saved_tcp_t));
+					memcpy(&new_tcp->local_port, &segment->destination_port, 2);
+					memcpy(&new_tcp->remote_port, &segment->source_port, 2);
+					memcpy(&new_tcp->remote_address, &packet->source_address, 16);
+
+					if (!hthaskey(*known_tcp, new_tcp, sizeof(saved_tcp_t))) {
+						valid = 0;
+						if (!hthaskey(*blacklist, packet->source_address, 16)) {
+							void *key = memdup(packet->source_address, 16);
+							htinsert(*blacklist, key, 16, 0);
+							blklist_push(key);
+							blklist_pull(*blacklist);
+						}
+					}
+					free(new_tcp);
+				}
+			}
+		}
+
+		if (valid == 1) {
+			if (write(tap, (void *) frame, rdct) == -1) {
 				perror("write");
+			}
+			if (!hthaskey(*known_addrs, frame->src, 6)) {
+				void *key = memdup(frame->src, 6);
+				void *val = memdup(&from, sizeof(struct sockaddr_in));
+				htinsert(*known_addrs, key, 6, val);
+			} else {
+				memcpy(htfind(*known_addrs, frame->src, 6),
+				       &from, sizeof(struct sockaddr_in));
 			}
 		}
 	}
-
-	if (false == htinsert(*known_addresses, current_frame->src, 6, (void *) &from)) {
-		perror("htinsert");
-	}
+	free(frame);
 }
 
 /* addresscmp
@@ -495,7 +576,16 @@ int addresscmp (void* addr1, void* addr2) {
  */
 static
 int tcpcmp (void* tcp1, void* tcp2) {
-	return memcmp (tcp1, tcp2, 40);
+	return memcmp (tcp1, tcp2, sizeof(saved_tcp_t));
+}
+
+/* ipaddrcmp
+ *
+ * Comparison function for two ipv6 addresses
+ */
+static
+int ipaddrcmp(void* ipaddr1, void* ipaddr2) {
+	return memcmp (ipaddr1, ipaddr2, 16);
 }
 
 /* freepair
@@ -506,4 +596,61 @@ static
 void freepair (void* key, void* val) {
 	free(key);
 	free(val);
+}
+
+/* memdup
+ *
+ * Malloc and copy memory
+ */
+static
+void* memdup(void* mem, size_t size) {
+	void* newmem = malloc(size);
+	memcpy(newmem, mem, size);
+	return newmem;
+}
+
+/* isbcaddr
+ *
+ * Check for broadcast MAC address
+ */
+static
+int isbcaddr(uint8_t addr[6]) {
+	uint8_t bc[6] = {0};
+	for (int i = 0; i < 6; i++) {
+		bc[i] = 0xFF;
+	}
+	uint8_t mc[6] = {0};
+	mc[0] = 0x33;
+	mc[1] = 0x33;
+	int r = 0;
+	if (memcmp(&bc, &addr, 6) == 0 || memcmp(&mc, &addr, 2) == 0)
+		r = 1;
+	return r;
+}
+
+/* blklist_init
+ *
+ * Initialize TCP blacklist server
+ */
+static
+void blklist_init() {
+
+}
+
+/* blklist_push
+ *
+ * Push a blacklisted IP address to the server
+ */
+static
+void blklist_push(void* addr) {
+
+}
+
+/* blklist_pull
+ *
+ * Pull the blacklisted ip addresses and add them to hashtable
+ */
+static
+void blklist_pull(hashtable ht) {
+
 }
