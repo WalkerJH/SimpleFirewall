@@ -212,3 +212,17 @@ bool hthaskey(hashtable ht, void* key, size_t keysz) {
 bool hthasstrkey(hashtable ht, char* key) {
   return hthaskey(ht, key, strlen(key));
 }
+
+/* Return key at position <index>
+ *
+*/
+void* htgetkey(hashtable ht, int index) {
+	return ht->table[index].key;
+}
+
+/* Return load
+ *
+ */
+int htgetload(hashtable ht) {
+	return ht->load;
+}

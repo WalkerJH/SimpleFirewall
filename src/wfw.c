@@ -25,7 +25,11 @@
 #define ANYIF     "0.0.0.0"
 #define ANYPORT   "0"
 #define PID       "pidfile"
-
+#define LOG       "logfile"
+#define GROUP1    "group1"
+#define GROUP2    "group2"
+#define GROUP3    "group3"
+#define SRVPORT   "srvport"
 
 /* Globals  */
 static char* conffile   = STR(SYSCONFDIR) "/wfw.cfg";
@@ -157,7 +161,8 @@ int mkfdset(fd_set* set, ...);
  * socket.  Data broadcast on the socket is written to the tap.  
  */
 static
-void bridge(int tap, int in, int out, struct sockaddr_in bcaddr);
+void bridge(int tap, int in, int out, struct sockaddr_in bcaddr,
+            int srv, struct sockaddr_in srvaddr, FILE* logfile);
 
 /* sendtraffic
  *
@@ -165,7 +170,8 @@ void bridge(int tap, int in, int out, struct sockaddr_in bcaddr);
  */
 static
 void sendtraffic(int tap, int out, struct sockaddr_in bcaddr,
-                 hashtable* known_addrs, hashtable* known_tcp, hashtable* blacklist);
+                 hashtable* known_addrs, hashtable* known_tcp, hashtable* blacklist,
+                 FILE* logfile);
 
 /* gettraffic
  *
@@ -173,7 +179,8 @@ void sendtraffic(int tap, int out, struct sockaddr_in bcaddr,
  */
 static
 void gettraffic(int tap, int socket, hashtable* known_addrs,
-											hashtable* known_tcp, hashtable* blacklist);
+								hashtable* known_tcp, hashtable* blacklist,
+								FILE* logfile);
 
 /* addresscmp
  *
@@ -217,31 +224,60 @@ void* memdup(void* addr, size_t size);
 static
 int isbcaddr(uint8_t addr[6]);
 
-/* blklist_init
+/* blacklist_init
  *
  * Initialize TCP blacklist server
  */
 static
-void blklist_init();
+void blacklist_init(hashtable conf, struct sockaddr_in* srvaddr, int* srv);
 
-/* blklist_push
+/* blacklist_update
  *
- * Push a blacklisted IP address to the server
+ * Send and recieve blacklisted ips
  */
 static
-void blklist_push(void* addr);
+void blacklist_update(int srv, struct sockaddr_in srvaddr, hashtable* blacklist,
+											FILE* logfile);
 
-/* blklist_pull
+/* createlog
  *
- * Pull the blacklisted ip addresses and add them to hashtable
+ * Create the log file
  */
 static
-void blklist_pull(hashtable ht);
+FILE* createlog(hashtable conf);
+
+/* logip6
+ *
+ * Write <label>: <ip address> to the log file
+ */
+static
+void logip6(FILE* logfile, char* label, uint8_t ip[16]);
+
+/* logmac
+ *
+ * Write <label>: <mac address> to the log file
+ */
+static
+void logmac(FILE* logfile, char* label, uint8_t mac[6]);
+
+/* daemonize
+ *
+ * Make this a background daemon process
+ */
+static
+void daemonize(hashtable conf);
+
+/* parseaddr
+ *
+ * parse ip address from string
+ */
+static
+uint8_t* parseaddr(char* addrstr, size_t size);
 
 /* Main
  * 
- * Mostly, main parses the command line, the conf file, creates the necessary
- * structures and then calls bridge.  Bridge is where the real work is done. 
+ * Parse the command line & the conf file.
+ * Initialize, then call bridge, then clean up.
  */
 int main(int argc, char* argv[]) {
 	puts("WFW Initialized\n");
@@ -264,21 +300,22 @@ int main(int argc, char* argv[]) {
       bcaddr       = makesockaddr (htstrfind (conf,BROADCAST),
                                    htstrfind (conf, PORT));
 
-    daemon(0,0);
-    if (hthasstrkey(conf, PID)) {
-	    FILE *pidfile = fopen(htstrfind(conf, PID), "w");
-	    if (pidfile != NULL) {
-		    fprintf(pidfile, "%d\n", getpid());
-		    fclose(pidfile);
-	    }
-    }
+    int srv;
+    struct sockaddr_in srvaddr;
+	  blacklist_init(conf, &srvaddr, &srv);
 
-    bridge(tap, in, out, bcaddr);
+    daemonize(conf);
+
+    FILE *logfile = createlog(conf);
+
+    bridge(tap, in, out, bcaddr, srv, srvaddr, logfile);
     
     close(in);
     close(out);
     close(tap);
     htfree(conf);
+
+    fclose(logfile);
   }
 
   return result;
@@ -366,16 +403,16 @@ int ensuresocket(char* localaddr, char* port) {
   }
 
   struct sockaddr_in addr = makesockaddr(localaddr, port);
-  if(0 != bind(sock, (struct sockaddr*)&addr, sizeof(addr))) {
+  if(bind(sock, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
     perror("bind");
     char buf[80];
     fprintf(stderr,
             "failed to bind to %s\n",
             inet_ntop(AF_INET, &(addr.sin_addr), buf, 80));
-    exit(EXIT_FAILURE);
+	  exit(EXIT_FAILURE);
   }
 
-  return sock;  
+  return sock;
 }
 
 /* Make Sock Addr
@@ -423,33 +460,37 @@ int mkfdset(fd_set* set, ...) {
  * Note the use of select, sendto, and recvfrom.  
  */
 static
-void bridge(int tap, int in, int out, struct sockaddr_in bcaddr) {
+void bridge(int tap, int in, int out, struct sockaddr_in bcaddr,
+						int srv, struct sockaddr_in srvaddr, FILE* logfile) {
 #define BUFSZ 1514
 
 	fd_set rdset;
 
-	int maxfd = mkfdset(&rdset, tap, in, out, 0);
+	int maxfd = mkfdset(&rdset, tap, in, out, srv, 0);
 
-	hashtable known_addrs = htnew(16, addresscmp, freepair);
-	hashtable known_tcp   = htnew(sizeof(saved_tcp_t), tcpcmp, freepair);
-	hashtable blacklist   = htnew(16, ipaddrcmp, freepair);
-	blklist_init();
+	hashtable known_addrs = htnew(32, addresscmp, freepair);
+	hashtable known_tcp   = htnew(32, tcpcmp, freepair);
+	hashtable blacklist   = htnew(32, ipaddrcmp, freepair);
 
 	while (0 <= select(1 + maxfd, &rdset, NULL, NULL, NULL)) {
 
 		if (FD_ISSET(tap, &rdset)) {
-			sendtraffic(tap, out, bcaddr, &known_addrs, &known_tcp, &blacklist);
+			sendtraffic(tap, out, bcaddr, &known_addrs, &known_tcp, &blacklist, logfile);
 		}
 
 		else if (FD_ISSET(in, &rdset)) {
-			gettraffic(tap, in, &known_addrs, &known_tcp, &blacklist);
+			gettraffic(tap, in, &known_addrs, &known_tcp, &blacklist, logfile);
 		}
 
 		else if (FD_ISSET(out, &rdset)) {
-			gettraffic(tap, out, &known_addrs, &known_tcp, &blacklist);
+			gettraffic(tap, out, &known_addrs, &known_tcp, &blacklist, logfile);
 		}
 
-		maxfd = mkfdset(&rdset, tap, in, out, 0);
+		else if (FD_ISSET(srv, &rdset)) {
+			blacklist_update(srv, srvaddr, &blacklist, logfile);
+		}
+
+		maxfd = mkfdset(&rdset, tap, in, out, srv, 0);
 	}
 
 	htfree(known_addrs);
@@ -463,7 +504,8 @@ void bridge(int tap, int in, int out, struct sockaddr_in bcaddr) {
  */
 static
 void sendtraffic(int tap, int out, struct sockaddr_in bcaddr,
-									hashtable* known_addrs, hashtable* known_tcp, hashtable* blacklist) {
+									hashtable* known_addrs, hashtable* known_tcp, hashtable* blacklist,
+									FILE* logfile) {
 	frame_t *frame  = malloc(sizeof(frame_t));
 	ssize_t rdct = read(tap, (void*)frame, BUFSZ);
 	if (rdct < 0) {
@@ -472,7 +514,7 @@ void sendtraffic(int tap, int out, struct sockaddr_in bcaddr,
 		struct sockaddr_in* socket;
 		socket = &bcaddr;
 
-		if (isbcaddr(frame->dst) == 0 && hthaskey(*known_addrs, frame->dst, 6)) {
+		if (hthaskey(*known_addrs, frame->dst, 6)) {
 			socket = (struct sockaddr_in *)htfind(*known_addrs, frame->dst, 6);
 		}
 		if (sendto(out, (void *)frame, rdct, 0,
@@ -492,6 +534,7 @@ void sendtraffic(int tap, int out, struct sockaddr_in bcaddr,
 
 					if (!hthaskey(*known_tcp, new_tcp, sizeof(saved_tcp_t))) {
 						htinsert(*known_tcp, new_tcp, sizeof(saved_tcp_t), 0);
+						logip6(logfile, "Initiated TCP to", packet->destination_address);
 					}
 				}
 			}
@@ -506,7 +549,8 @@ void sendtraffic(int tap, int out, struct sockaddr_in bcaddr,
  */
 static
 void gettraffic (int tap, int socket,
-									hashtable* known_addrs, hashtable* known_tcp, hashtable* blacklist) {
+									hashtable* known_addrs, hashtable* known_tcp, hashtable* blacklist,
+									FILE* logfile) {
 	int valid = 1;
 	struct sockaddr_in from;
 	frame_t *frame = malloc(sizeof(frame_t));
@@ -520,7 +564,7 @@ void gettraffic (int tap, int socket,
 		if (frame->type == TYPE_IPV6) {
 			packet_t *packet = (packet_t *) frame->payload;
 			if (hthaskey(*blacklist, packet->source_address, 16)) {
-			//	valid = 0;
+				valid = 0;
 			}
 			if (packet->next_header == NEXT_TCP) {
 				tcpsegment_t *segment = (tcpsegment_t *) packet->headers;
@@ -535,8 +579,8 @@ void gettraffic (int tap, int socket,
 						if (!hthaskey(*blacklist, packet->source_address, 16)) {
 							void *key = memdup(packet->source_address, 16);
 							htinsert(*blacklist, key, 16, 0);
-							blklist_push(key);
-							blklist_pull(*blacklist);
+							// TODO: blacklist_update(*blacklist);
+							logip6(logfile, "Bad IP", packet->source_address);
 						}
 					}
 					free(new_tcp);
@@ -548,13 +592,16 @@ void gettraffic (int tap, int socket,
 			if (write(tap, (void *) frame, rdct) == -1) {
 				perror("write");
 			}
-			if (!hthaskey(*known_addrs, frame->src, 6)) {
-				void *key = memdup(frame->src, 6);
-				void *val = memdup(&from, sizeof(struct sockaddr_in));
-				htinsert(*known_addrs, key, 6, val);
-			} else {
-				memcpy(htfind(*known_addrs, frame->src, 6),
-				       &from, sizeof(struct sockaddr_in));
+			if (!isbcaddr(frame->src)) {
+				if (!hthaskey(*known_addrs, frame->src, 6)) {
+					void *key = memdup(frame->src, 6);
+					void *val = memdup(&from, sizeof(struct sockaddr_in));
+					htinsert(*known_addrs, key, 6, val);
+					logmac(logfile, "Added MAC", frame->src);
+				} else {
+					memcpy(htfind(*known_addrs, frame->src, 6),
+					       &from, sizeof(struct sockaddr_in));
+				}
 			}
 		}
 	}
@@ -622,35 +669,159 @@ int isbcaddr(uint8_t addr[6]) {
 	uint8_t mc[6] = {0};
 	mc[0] = 0x33;
 	mc[1] = 0x33;
-	int r = 0;
+	int r = false;
 	if (memcmp(&bc, &addr, 6) == 0 || memcmp(&mc, &addr, 2) == 0)
-		r = 1;
+		r = true;
 	return r;
 }
 
-/* blklist_init
+/* blacklist_init
  *
  * Initialize TCP blacklist server
  */
 static
-void blklist_init() {
+void blacklist_init(hashtable conf, struct sockaddr_in* srvaddr, int* srv) {
+	int port = atoi(htstrfind(conf, SRVPORT));
+	printf("Initializing TCP server on port %d\n", port);
+	fflush(stdout);
 
+	int s = socket(AF_INET, SOCK_STREAM, 0);
+
+	struct sockaddr_in addr;
+	bzero(&addr, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(port);
+	addr.sin_addr.s_addr = 0;
+
+	if (bind(s, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
+		perror("bind");
+		close(s);
+		exit(EXIT_FAILURE);
+	}
+	if (listen(s, 1) == -1) {
+		perror("listen");
+		close(s);
+		exit(EXIT_FAILURE);
+	}
+
+	memcpy(srvaddr, &addr, sizeof(addr));
+	memcpy(srv, &s, sizeof(int));
+	printf("TCP Server running on port %d\n", htons(srvaddr->sin_port));
+	fflush(stdout);
 }
 
-/* blklist_push
+/* blacklist_update
  *
- * Push a blacklisted IP address to the server
+ * Recieve blacklisted IP(s) and send my blacklist table
  */
 static
-void blklist_push(void* addr) {
+void blacklist_update(int srv, struct sockaddr_in srvaddr, hashtable* blacklist, FILE* logfile) {
+	socklen_t len = sizeof(srvaddr);
+	int c = accept(srv, (struct sockaddr *)&srvaddr, &len);
+	FILE *srvfile = fdopen(c, "w+");
+	int num_ips_in = 0;
+	char numstr[20];
+	fgets(numstr, 20, srvfile);
+	fflush(srvfile);
+	num_ips_in = atoi(numstr);
+	fprintf(logfile, "Getting %d ips over tcp\n", num_ips_in);
+	fflush(logfile);
+	for (int i = 0; i < num_ips_in; i++) {
+		char addrstr[18];
+		fgets(addrstr, 18, srvfile);
+		fflush(srvfile);
+		uint8_t* addr = parseaddr(addrstr, 16);
+		htinsert(*blacklist, addr, 16, 0);
+		logip6(logfile, "Bad IP from network", addr);
+	}
 
+	fprintf(srvfile, "%d\n", htgetload(*blacklist));
+	fflush(srvfile);
+	for (int i = 0; i < 32; i++) {
+		uint8_t* ip = (uint8_t*)htgetkey(*blacklist, i);
+		if (ip != NULL) {
+			for (int i = 0; i < 16; i++) {
+				fprintf(srvfile, "%c", ip[i]);
+			}
+			fprintf(srvfile, "\n");
+			fflush(srvfile);
+		}
+	}
+	close(c);
 }
 
-/* blklist_pull
+/* createlog
  *
- * Pull the blacklisted ip addresses and add them to hashtable
+ * Create the log file
  */
 static
-void blklist_pull(hashtable ht) {
+FILE* createlog(hashtable conf) {
+	FILE *f;
+	if (hthasstrkey(conf, LOG)) {
+		f = fopen(htstrfind(conf, LOG), "w");
+		fprintf(f, "--Firewall Log--\n");
+		fflush(f);
+	}
+	return f;
+}
 
+/* logip6
+ *
+ * Write <label>: <ip address> to the log file
+ */
+static
+void logip6(FILE* logfile, char* label, uint8_t ip[16]) {
+	fprintf(logfile, "%-20s", label);
+	for (int i = 0; i < 16; i++) {
+		if (i%2 == 0 && i != 0)
+			fprintf(logfile, ":");
+		fprintf(logfile, "%x", ip[i]);
+	}
+	fprintf(logfile, "\n");
+	fflush(logfile);
+}
+
+/* logmac
+ *
+ * Write <label>: <mac address> to the log file
+ */
+static
+void logmac(FILE* logfile, char* label, uint8_t mac[6]) {
+	fprintf(logfile, "%-20s", label);
+	for (int i = 0; i < 6; i++) {
+		if (i%2 == 0 && i != 0)
+			fprintf(logfile, "-");
+		fprintf(logfile, "%X", mac[i]);
+	}
+	fprintf(logfile, "\n");
+	fflush(logfile);
+}
+
+/* daemonize
+ *
+ * Make this a background daemon process
+ */
+static
+void daemonize(hashtable conf) {
+	daemon(0,0);
+	if (hthasstrkey(conf, PID)) {
+		FILE *pidfile = fopen(htstrfind(conf, PID), "w");
+		if (pidfile != NULL) {
+			fprintf(pidfile, "%d\n", getpid());
+			fclose(pidfile);
+		}
+	}
+}
+
+/* parseaddr
+ *
+ * parse ip address from string
+ */
+static
+uint8_t* parseaddr(char* addrstr, size_t size) {
+	uint8_t* addr = malloc(sizeof(uint8_t)*size);
+	for (int i = 0; i < size; i++) {
+		addr[i] = atoi(&addrstr[i]);
+	}
+	return addr;
 }

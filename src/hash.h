@@ -51,5 +51,14 @@ void* htstrfind(hashtable ht, char* key);
 bool hthaskey(hashtable ht, void* key, size_t keysz);
 bool hthasstrkey(hashtable ht, char* key);
 
+/* Return key at position <index>
+ *
+*/
+void* htgetkey(hashtable ht, int index);
+
+/* Return load
+ *
+ */
+int htgetload(hashtable ht);
 
 #endif 
