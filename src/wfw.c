@@ -54,8 +54,8 @@ typedef struct packet {
 	uint16_t payload_length;
 	uint8_t next_header;
 	uint8_t hop_limit;
-	uint8_t source_address[16];
-	uint8_t destination_address[16];
+	uint8_t source_addr[16];
+	uint8_t destination_addr[16];
 	uint8_t headers[];
 } packet_t;
 
@@ -86,7 +86,7 @@ typedef struct tcpsegment {
 typedef struct saved_tcp {
 	uint16_t local_port;
 	uint16_t remote_port;
-	uint8_t remote_address[16];
+	uint8_t remote_addr[16];
 } saved_tcp_t;
 
 /* Prototypes */
@@ -123,23 +123,23 @@ static
 int  ensuretap(char* path);
 
 /* Ensure Socket
- * localaddress   The IPv4 address to bind this socket to.
+ * localaddr   The IPv4 addr to bind this socket to.
  * port           The port number to bind this socket to.
  *
- * This function creates a bound socket.  Notice that both the local address and
+ * This function creates a bound socket.  Notice that both the local addr and
  * the port number are strings.  
  */
 static
 int ensuresocket(char* localaddr, char* port);
 
-/* Make Socket Address
- * address, port  The string representation of an IPv4 socket address.
+/* Make Socket addr
+ * addr, port  The string representation of an IPv4 socket addr.
  *
- * This is a convince routine to convert an address-port pair to an IPv4 socket
- * address.  
+ * This is a convince routine to convert an addr-port pair to an IPv4 socket
+ * addr.  
  */
 static
-struct sockaddr_in makesockaddr(char* address, char* port);
+struct sockaddr_in makesockaddr(char* addr, char* port);
 
 /* mkfdset
  * set    The fd_set to populate
@@ -155,7 +155,7 @@ int mkfdset(fd_set* set, ...);
  * tap     The local tap device
  * in      The network socket that receives broadcast packets.
  * out     The network socket on which to send broadcast packets.
- * bcaddr  The broadcast address for the virtual ethernet link.
+ * bcaddr  The broadcast addr for the virtual ethernet link.
  *
  * This is the main loop for wfw.  Data from the tap is broadcast on the
  * socket.  Data broadcast on the socket is written to the tap.  
@@ -183,12 +183,12 @@ void gettraffic (int tap, int socket, struct sockaddr_in teamaddr1, struct socka
                  hashtable* known_addrs, hashtable* known_tcp, hashtable* blacklist,
                  FILE* logfile);
 
-/* addresscmp
+/* addrcmp
  *
- * Comparison function for two MAC addresses
+ * Comparison function for two MAC addres
  */
 static
-int addresscmp(void* addr1, void* addr2);
+int addrcmp(void* addr1, void* addr2);
 
 /* tcpcmp
  *
@@ -199,7 +199,7 @@ int tcpcmp(void* tcp1, void* tcp2);
 
 /* ipaddrcmp
  *
- * Comparison function for two ipv6 addresses
+ * Comparison function for two ipv6 addres
  */
 static
 int ipaddrcmp(void* ipaddr1, void* ipaddr2);
@@ -220,7 +220,7 @@ void* memdup(void* addr, size_t size);
 
 /* isbcaddr
  *
- * Check for broadcast MAC address
+ * Check for broadcast MAC addr
  */
 static
 int isbcaddr(uint8_t addr[6]);
@@ -232,13 +232,6 @@ int isbcaddr(uint8_t addr[6]);
 static
 void blacklist_init(hashtable conf, struct sockaddr_in* srvaddr, int* srv);
 
-/* blacklist_get
- *
- * Recieve blacklisted IP(s) and send my blacklist table
- */
-static
-void blacklist_get(int srv, struct sockaddr_in srvaddr, hashtable* blacklist,
-                   FILE* logfile);
 /* teaminit
  *
  * Initialize team member's servers
@@ -246,6 +239,14 @@ void blacklist_get(int srv, struct sockaddr_in srvaddr, hashtable* blacklist,
 static
 void teaminit(hashtable conf, struct sockaddr_in* s1,
               struct sockaddr_in* s2, struct sockaddr_in* s3);
+
+/* blacklist_get
+ *
+ * Recieve blacklisted IP(s) and send my blacklist table
+ */
+static
+void blacklist_get(int srv, struct sockaddr_in srvaddr, hashtable* blacklist,
+                   FILE* logfile);
 
 /* blacklist_send
  *
@@ -271,14 +272,14 @@ FILE* createlog(hashtable conf);
 
 /* logip6
  *
- * Write <label>: <ip address> to the log file
+ * Write <label>: <ip addr> to the log file
  */
 static
 void logip6(FILE* logfile, char* label, uint8_t ip[16]);
 
 /* logmac
  *
- * Write <label>: <mac address> to the log file
+ * Write <label>: <mac addr> to the log file
  */
 static
 void logmac(FILE* logfile, char* label, uint8_t mac[6]);
@@ -292,17 +293,24 @@ void daemonize(hashtable conf);
 
 /* parseaddr
  *
- * parse ip address from string
+ * parse ip addr from chunk of chars
  */
 static
 uint8_t* parseaddr(char* addrstr, size_t size);
 
-/* printaddr
+/* parseaddr_s
  *
- * print ip address to file
+ * parse ip addr from readable string
  */
 static
-void printaddr(FILE* f, uint8_t ip[16]);
+uint8_t* parseaddr_s(char* addrstr, size_t size);
+
+/* writeaddr
+ *
+ * write ip addr to file
+ */
+static
+void writeaddr(FILE* f, uint8_t ip[16]);
 
 
 /* Main
@@ -505,14 +513,15 @@ void bridge(int tap, int in, int out, struct sockaddr_in bcaddr,
 
 	int maxfd = mkfdset(&rdset, tap, in, out, srv, 0);
 
-	hashtable known_addrs = htnew(32, addresscmp, freepair);
+	hashtable known_addrs = htnew(32, addrcmp, freepair);
 	hashtable known_tcp   = htnew(32, tcpcmp, freepair);
 	hashtable blacklist   = htnew(32, ipaddrcmp, freepair);
 
 	while (0 <= select(1 + maxfd, &rdset, NULL, NULL, NULL)) {
 
 		if (FD_ISSET(tap, &rdset)) {
-			sendtraffic(tap, out, bcaddr, &known_addrs, &known_tcp, &blacklist, logfile);
+			sendtraffic(tap, out, bcaddr, &known_addrs, 
+				&known_tcp, &blacklist, logfile);
 		}
 
 		else if (FD_ISSET(in, &rdset)) {
@@ -543,8 +552,8 @@ void bridge(int tap, int in, int out, struct sockaddr_in bcaddr,
  */
 static
 void sendtraffic(int tap, int out, struct sockaddr_in bcaddr,
-									hashtable* known_addrs, hashtable* known_tcp, hashtable* blacklist,
-									FILE* logfile) {
+									hashtable* known_addrs, hashtable* known_tcp, 
+									hashtable* blacklist, FILE* logfile) {
 	frame_t *frame  = malloc(sizeof(frame_t));
 	ssize_t rdct = read(tap, (void*)frame, BUFSZ);
 	if (rdct < 0) {
@@ -565,15 +574,15 @@ void sendtraffic(int tap, int out, struct sockaddr_in bcaddr,
 			packet_t *packet = (packet_t *)frame->payload;
 			if (packet->next_header == NEXT_TCP) {
 				tcpsegment_t *segment = (tcpsegment_t *)packet->headers;
-				if (segment->SYN == 1) {
+				if (segment->SYN) {
 					saved_tcp_t *new_tcp = malloc(sizeof(saved_tcp_t));
 					memcpy(&new_tcp->local_port, &segment->source_port, 2);
 					memcpy(&new_tcp->remote_port, &segment->destination_port, 2);
-					memcpy(&new_tcp->remote_address, &packet->destination_address, 16);
+					memcpy(&new_tcp->remote_addr, &packet->destination_addr, 16);
 
 					if (!hthaskey(*known_tcp, new_tcp, sizeof(saved_tcp_t))) {
 						htinsert(*known_tcp, new_tcp, sizeof(saved_tcp_t), 0);
-						logip6(logfile, "Initiated TCP to", packet->destination_address);
+						logip6(logfile, "Initiated TCP to", packet->destination_addr);
 					}
 				}
 			}
@@ -587,7 +596,8 @@ void sendtraffic(int tap, int out, struct sockaddr_in bcaddr,
  * Recieve traffic on given device
  */
 static
-void gettraffic (int tap, int socket, struct sockaddr_in teamaddr1, struct sockaddr_in teamaddr2,
+void gettraffic (int tap, int socket, struct sockaddr_in teamaddr1, 
+									struct sockaddr_in teamaddr2,
 									hashtable* known_addrs, hashtable* known_tcp, hashtable* blacklist,
 									FILE* logfile) {
 	int valid = 1;
@@ -602,28 +612,28 @@ void gettraffic (int tap, int socket, struct sockaddr_in teamaddr1, struct socka
 
 		if (frame->type == TYPE_IPV6) {
 			packet_t *packet = (packet_t *) frame->payload;
-			if (hthaskey(*blacklist, packet->source_address, 16)) {
+			if (hthaskey(*blacklist, packet->source_addr, 16)) {
 				valid = 0;
 			}
 			if (packet->next_header == NEXT_TCP) {
 				tcpsegment_t *segment = (tcpsegment_t *) packet->headers;
-				if (segment->SYN == 1) {
+				if (segment->SYN) {
 					saved_tcp_t *new_tcp = malloc(sizeof(saved_tcp_t));
 					memcpy(&new_tcp->local_port, &segment->destination_port, 2);
 					memcpy(&new_tcp->remote_port, &segment->source_port, 2);
-					memcpy(&new_tcp->remote_address, &packet->source_address, 16);
+					memcpy(&new_tcp->remote_addr, &packet->source_addr, 16);
 
 					if (!hthaskey(*known_tcp, new_tcp, sizeof(saved_tcp_t))) {
 						valid = 0;
-						if (!hthaskey(*blacklist, packet->source_address, 16)) {
-							void *key = memdup(packet->source_address, 16);
+						if (!hthaskey(*blacklist, packet->source_addr, 16)) {
+							void *key = memdup(packet->source_addr, 16);
 							htinsert(*blacklist, key, 16, 0);
 
-							void *iptosend = memdup(packet->source_address, 16);
+							void *iptosend = memdup(packet->source_addr, 16);
 							blacklist_send(teamaddr1, iptosend, blacklist, logfile);
 							blacklist_send(teamaddr2, iptosend, blacklist, logfile);
 
-							logip6(logfile, "Bad IP", packet->source_address);
+							logip6(logfile, "Bad IP", packet->source_addr);
 						}
 					}
 					free(new_tcp);
@@ -631,7 +641,7 @@ void gettraffic (int tap, int socket, struct sockaddr_in teamaddr1, struct socka
 			}
 		}
 
-		if (valid == 1) {
+		if (valid) {
 			if (write(tap, (void *) frame, rdct) == -1) {
 				perror("write");
 			}
@@ -651,12 +661,12 @@ void gettraffic (int tap, int socket, struct sockaddr_in teamaddr1, struct socka
 	free(frame);
 }
 
-/* addresscmp
+/* addrcmp
  *
- * Comparison function for two MAC addresses
+ * Comparison function for two MAC addres
  */
 static
-int addresscmp (void* addr1, void* addr2) {
+int addrcmp (void* addr1, void* addr2) {
 	return memcmp (addr1, addr2, 6);
 }
 
@@ -671,7 +681,7 @@ int tcpcmp (void* tcp1, void* tcp2) {
 
 /* ipaddrcmp
  *
- * Comparison function for two ipv6 addresses
+ * Comparison function for two ipv6 addres
  */
 static
 int ipaddrcmp(void* ipaddr1, void* ipaddr2) {
@@ -701,7 +711,7 @@ void* memdup(void* mem, size_t size) {
 
 /* isbcaddr
  *
- * Check for broadcast MAC address
+ * Check for broadcast MAC addr
  */
 static
 int isbcaddr(uint8_t addr[6]) {
@@ -753,6 +763,30 @@ void blacklist_init(hashtable conf, struct sockaddr_in* srvaddr, int* srv) {
 	fflush(stdout);
 }
 
+/* teaminit
+ *
+ * Initialize team member's servers
+ */
+static
+void teaminit(hashtable conf, struct sockaddr_in* s1,
+              struct sockaddr_in* s2, struct sockaddr_in* s3) {
+	if (hthasstrkey(conf, TEAMADDR1)) {
+		struct sockaddr_in _s1 = makesockaddr(htstrfind(conf, TEAMADDR1),
+		                                      htstrfind(conf, SRVPORT));
+		memcpy(s1, &_s1, sizeof(struct sockaddr_in));
+	}
+	if (hthasstrkey(conf, TEAMADDR2)) {
+		struct sockaddr_in _s2 = makesockaddr(htstrfind(conf, TEAMADDR2),
+		                                      htstrfind(conf, SRVPORT));
+		memcpy(s2, &_s2, sizeof(struct sockaddr_in));
+	}
+	if (hthasstrkey(conf, TEAMADDR3)) {
+		struct sockaddr_in _s3 = makesockaddr(htstrfind(conf, TEAMADDR3),
+		                                      htstrfind(conf, SRVPORT));
+		memcpy(s3, &_s3, sizeof(struct sockaddr_in));
+	}
+}
+
 /* blacklist_get
  *
  * Recieve blacklisted IP(s) and send my blacklist table
@@ -765,6 +799,8 @@ void blacklist_get(int srv, struct sockaddr_in srvaddr, hashtable* blacklist,
 	FILE *srvfile = fdopen(c, "w+");
 
 	int num = readint(srvfile);
+	fprintf(logfile, "getting %d ips from network\n", num);
+	fflush(logfile);
 
 	for (int i = 0; i < num; i++) {
 		char addrstr[33];
@@ -779,38 +815,10 @@ void blacklist_get(int srv, struct sockaddr_in srvaddr, hashtable* blacklist,
 	for (int i = 0; i < 32; i++) {
 		uint8_t* ip = (uint8_t*)htgetkey(*blacklist, i);
 		if (ip != NULL) {
-			for (int i = 0; i < 16; i++) {
-				fprintf(srvfile, "%c", ip[i]);
-			}
-			fprintf(srvfile, "\n");
-			fflush(srvfile);
+			writeaddr(srvfile, ip);
 		}
 	}
 	close(c);
-}
-
-/* teaminit
- *
- * Initialize team member's servers
- */
-static
-void teaminit(hashtable conf, struct sockaddr_in* s1,
-							struct sockaddr_in* s2, struct sockaddr_in* s3) {
-	if (hthasstrkey(conf, TEAMADDR1)) {
-		struct sockaddr_in _s1 = makesockaddr(htstrfind(conf, TEAMADDR1),
-			htstrfind(conf, SRVPORT));
-		memcpy(s1, &_s1, sizeof(struct sockaddr_in));
-	}
-	if (hthasstrkey(conf, TEAMADDR2)) {
-		struct sockaddr_in _s2 = makesockaddr(htstrfind(conf, TEAMADDR2),
-			htstrfind(conf, SRVPORT));
-		memcpy(s2, &_s2, sizeof(struct sockaddr_in));
-	}
-	if (hthasstrkey(conf, TEAMADDR3)) {
-		struct sockaddr_in _s3 = makesockaddr(htstrfind(conf, TEAMADDR3),
-			htstrfind(conf, SRVPORT));
-		memcpy(s3, &_s3, sizeof(struct sockaddr_in));
-	}
 }
 
 /* blacklist_send
@@ -818,8 +826,8 @@ void teaminit(hashtable conf, struct sockaddr_in* s1,
  * Send blacklisted IP and get blacklist table
  */
 static
-void blacklist_send(struct sockaddr_in groupaddr, uint8_t* iptosend, hashtable* blacklist,
-										FILE* logfile) {
+void blacklist_send(struct sockaddr_in groupaddr, 
+										uint8_t* iptosend, hashtable* blacklist,FILE* logfile) {
 	int s = socket(PF_INET, SOCK_STREAM, 0);
 	if (connect(s, (struct sockaddr *)&groupaddr, sizeof(groupaddr)) != -1) {
 		fprintf(logfile, "Connected to group member's server successfully\n");
@@ -829,7 +837,7 @@ void blacklist_send(struct sockaddr_in groupaddr, uint8_t* iptosend, hashtable* 
 
 		fprintf(srvfile, "1\n");
 		fflush(srvfile);
-		printaddr(srvfile, iptosend);
+		writeaddr(srvfile, iptosend);
 
 		int num = readint(srvfile);
 
@@ -842,7 +850,6 @@ void blacklist_send(struct sockaddr_in groupaddr, uint8_t* iptosend, hashtable* 
 				logip6(logfile, "Bad IP from network", addr);
 			}
 		}
-		fclose(srvfile);
 		close(s);
 	} else {
 		perror("connect");
@@ -861,6 +868,7 @@ int readint(FILE* f) {
 	int num = 0;
 	char numstr[6];
 	fgets(numstr, 6, f);
+	num = atoi(numstr);
 	return num;
 }
 /* createlog
@@ -880,7 +888,7 @@ FILE* createlog(hashtable conf) {
 
 /* logip6
  *
- * Write <label>: <ip address> to the log file
+ * Write <label>: <ip addr> to the log file
  */
 static
 void logip6(FILE* logfile, char* label, uint8_t ip[16]) {
@@ -896,7 +904,7 @@ void logip6(FILE* logfile, char* label, uint8_t ip[16]) {
 
 /* logmac
  *
- * Write <label>: <mac address> to the log file
+ * Write <label>: <mac addr> to the log file
  */
 static
 void logmac(FILE* logfile, char* label, uint8_t mac[6]) {
@@ -928,10 +936,23 @@ void daemonize(hashtable conf) {
 
 /* parseaddr
  *
- * parse ip address from string
+ * parse ip addr from chars
  */
 static
 uint8_t* parseaddr(char* addrstr, size_t size) {
+	uint8_t* addr = malloc(sizeof(uint8_t)*size);
+	for (int i = 0; i < size; i ++) {
+		addr[i] = addrstr[i];
+	}
+	return addr;
+}
+
+/* parseaddr_s
+ *
+ * parse ip addr from readable string
+ */
+static
+uint8_t* parseaddr_s(char* addrstr, size_t size) {
 	uint8_t* addr = malloc(sizeof(uint8_t)*size);
 	for (int i = 0; i < size; i ++) {
 		char s[2];
@@ -941,14 +962,14 @@ uint8_t* parseaddr(char* addrstr, size_t size) {
 	return addr;
 }
 
-/* printaddr
+/* writeaddr
  *
- * print ip address to file
+ * write ip addr to file
  */
 static
-void printaddr(FILE* f, uint8_t ip[16]) {
+void writeaddr(FILE* f, uint8_t ip[16]) {
 	for (int i = 0; i < 16; i++) {
-		fprintf(f, "%x", ip[i]);
+		fprintf(f, "%c", ip[i]);
 	}
 	fprintf(f, "\n");
 	fflush(f);
