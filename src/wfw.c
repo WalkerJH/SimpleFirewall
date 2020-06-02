@@ -255,6 +255,13 @@ static
 void blacklist_send(struct sockaddr_in s, uint8_t* iptosend, hashtable* blacklist,
                     FILE* logfile);
 
+/* readint
+ *
+ * reads integer from the file
+ */
+static
+int readint(FILE* f);
+
 /* createlog
  *
  * Create the log file
@@ -826,7 +833,6 @@ void blacklist_send(struct sockaddr_in groupaddr, uint8_t* iptosend, hashtable* 
 
 		int num = readint(srvfile);
 
-		num = atoi(numstr);
 		if (num > 0) {
 			for (int i = 0; i < num; i++) {
 				char addrstr[33];
